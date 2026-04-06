@@ -292,7 +292,10 @@ def main():
     t_start = time.time()
 
     from generation_experiment import SteeringExperiment, compute_directions, MODEL_CONFIGS
-    from capping_experiment import compute_thresholds, run_capping_experiment, compute_compliance_axis, run_capability_eval
+    from capping_experiment import (
+        compute_thresholds, compute_discriminative_thresholds,
+        run_capping_experiment, compute_compliance_axis, run_capability_eval,
+    )
 
     output_dir = Path(args.output_dir or cfg["OUTPUT_DIR"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -358,16 +361,20 @@ def main():
 
     print(f"  Axis directions: {list(axis_directions.keys())}")
 
-    # --- Compute thresholds from calibration prompts ---
-    alphas = cfg["ALPHAS"]
+    # --- Compute discriminative thresholds ---
+    # τ = midpoint between mean(benign) and mean(jailbreak) at each cap layer.
+    # Uses WildJailbreak train split for the jailbreak side (no eval contamination).
     calibration_prompts = CALIBRATION_PROMPTS[:cfg["N_CALIBRATION"]]
-    print(f"\nComputing thresholds from {len(calibration_prompts)} calibration prompts...")
-    thresholds = compute_thresholds(
+    jailbreak_train_prompts = load_wildjailbreak_train(n_prompts=cfg["N_COMPLIANCE"])
+
+    print(f"\nComputing discriminative thresholds "
+          f"({len(calibration_prompts)} benign, {len(jailbreak_train_prompts)} jailbreak)...")
+    thresholds = compute_discriminative_thresholds(
         exp,
-        calibration_prompts=calibration_prompts,
+        benign_prompts=calibration_prompts,
+        jailbreak_prompts=jailbreak_train_prompts,
         axis_directions=axis_directions,
         cap_layers=cap_layers,
-        alphas=alphas,
     )
 
     # --- Load jailbreak dataset ---
@@ -396,18 +403,19 @@ def main():
         "timestamp":        datetime.now().isoformat(),
         "model_name":       MODEL_NAME,
         "cap_layers":       f"L{cap_layers[0]}-L{cap_layers[-1]}",
-        "alphas":           alphas,
+        "threshold_method": "discriminative_midpoint",
         "axis_names":       list(axis_directions.keys()),
         "thresholds": {
             axis: {
-                f"L{layer_idx}": {str(a): v for a, v in alpha_taus.items()}
-                for layer_idx, alpha_taus in layer_taus.items()
+                f"L{layer_idx}": layer_data
+                for layer_idx, layer_data in layer_taus.items()
             }
             for axis, layer_taus in thresholds.items()
         },
         "n_prompts":        len(prompts),
         "dataset":          "allenai/wildjailbreak (eval, adversarial_harmful)",
         "n_calibration":    len(calibration_prompts),
+        "n_jailbreak_train": len(jailbreak_train_prompts),
         "max_new_tokens":   cfg["MAX_NEW_TOKENS"],
         "temperature":      TEMPERATURE,
         "do_sample":        DO_SAMPLE,

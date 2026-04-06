@@ -196,6 +196,111 @@ def compute_thresholds(
 
 
 # ---------------------------------------------------------------------------
+# Discriminative threshold computation
+# ---------------------------------------------------------------------------
+
+def compute_discriminative_thresholds(
+    exp: SteeringExperiment,
+    benign_prompts: list[str],
+    jailbreak_prompts: list[str],
+    axis_directions: dict[str, torch.Tensor],
+    cap_layers: list[int],
+    max_new_tokens: int = 64,
+) -> dict[str, dict[int, dict[str, float]]]:
+    """Compute optimal per-layer thresholds from the midpoint of two distributions.
+
+    Rather than using a percentile of the benign distribution (alpha-based),
+    this sets τ = (mean_benign + mean_jailbreak) / 2 at each cap layer.
+    This places the threshold precisely in the gap between normal and jailbroken
+    activation distributions — maximally discriminating for equal-variance classes.
+
+    Also stores mean and std of each distribution so the caller can inspect
+    the separation margin.
+
+    Args:
+        benign_prompts:    Prompts where the model behaves normally (e.g. CALIBRATION_PROMPTS).
+        jailbreak_prompts: Prompts where the model is in jailbreak-compliant mode
+                           (e.g. WildJailbreak train adversarial_harmful).
+        axis_directions:   axis_name -> unit vector (float32, CPU).
+        cap_layers:        Layer indices where capping will be applied.
+
+    Returns:
+        thresholds[axis_name][layer_idx]["optimal"] = τ
+        Also stores "mean_benign", "mean_jailbreak", "std_benign", "std_jailbreak",
+        "separation" keys for diagnostics.
+    """
+    logger.info(
+        "Computing discriminative thresholds at L%d–L%d "
+        "(%d benign, %d jailbreak prompts)...",
+        cap_layers[0], cap_layers[-1],
+        len(benign_prompts), len(jailbreak_prompts),
+    )
+
+    # Collect projections at all cap layers for both groups
+    # projs[group][axis_name][layer_idx] = list[float]
+    def _collect_projections(prompts, label):
+        projs: dict[str, dict[int, list[float]]] = {
+            name: {layer_idx: [] for layer_idx in cap_layers}
+            for name in axis_directions
+        }
+        for prompt in tqdm(prompts, desc=f"  {label}", leave=False):
+            input_ids = exp.tokenize(prompt)
+            with ExitStack() as stack:
+                trackers: dict[tuple, _AxisProjectionTracker] = {}
+                for axis_name, axis_unit in axis_directions.items():
+                    for layer_idx in cap_layers:
+                        t = _AxisProjectionTracker(exp.layers[layer_idx], axis_unit)
+                        stack.enter_context(t)
+                        trackers[(axis_name, layer_idx)] = t
+                attention_mask = torch.ones_like(input_ids)
+                with torch.inference_mode():
+                    exp.model.generate(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                    )
+            for (axis_name, layer_idx), tracker in trackers.items():
+                projs[axis_name][layer_idx].extend(tracker.projections)
+        return projs
+
+    benign_projs   = _collect_projections(benign_prompts,   "Benign")
+    jailbreak_projs = _collect_projections(jailbreak_prompts, "Jailbreak")
+
+    thresholds: dict[str, dict[int, dict[str, float]]] = {}
+    for axis_name in axis_directions:
+        thresholds[axis_name] = {}
+        for layer_idx in cap_layers:
+            b_arr = np.array(benign_projs[axis_name][layer_idx],   dtype=np.float32)
+            j_arr = np.array(jailbreak_projs[axis_name][layer_idx], dtype=np.float32)
+            mean_b, mean_j = float(b_arr.mean()), float(j_arr.mean())
+            tau = (mean_b + mean_j) / 2.0
+            separation = mean_b - mean_j   # positive = benign projects higher (good)
+            thresholds[axis_name][layer_idx] = {
+                "optimal":        tau,
+                "mean_benign":    mean_b,
+                "mean_jailbreak": mean_j,
+                "std_benign":     float(b_arr.std()),
+                "std_jailbreak":  float(j_arr.std()),
+                "separation":     separation,
+            }
+
+        # Log summary at first and last cap layer
+        for layer_idx in [cap_layers[0], cap_layers[-1]]:
+            d = thresholds[axis_name][layer_idx]
+            logger.info(
+                "  %s L%d: benign=%.1f±%.1f  jailbreak=%.1f±%.1f  "
+                "sep=%.1f  τ=%.1f",
+                axis_name, layer_idx,
+                d["mean_benign"], d["std_benign"],
+                d["mean_jailbreak"], d["std_jailbreak"],
+                d["separation"], d["optimal"],
+            )
+
+    return thresholds
+
+
+# ---------------------------------------------------------------------------
 # Compliance axis construction
 # ---------------------------------------------------------------------------
 
