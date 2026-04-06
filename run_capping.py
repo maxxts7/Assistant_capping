@@ -60,8 +60,8 @@ PRESETS = {
     ),
     "full": dict(
         VERSION="v1.0",
-        VERSION_NOTES="Full run — all 100 jailbreak behaviors, 4 threshold settings",
-        N_PROMPTS=None,
+        VERSION_NOTES="Full run — 100 adversarial_harmful prompts, 4 threshold settings",
+        N_PROMPTS=100,
         ALPHAS=[0.1, 0.25, 0.5, 0.75],
         MAX_NEW_TOKENS=256,
         OUTPUT_DIR="results/capping_full",
@@ -69,8 +69,8 @@ PRESETS = {
     ),
     "paper": dict(
         VERSION="paper",
-        VERSION_NOTES="Paper replication — α=0.25 (25th pct threshold), all 100 behaviors",
-        N_PROMPTS=None,
+        VERSION_NOTES="Paper replication — α=0.25 (25th pct threshold), 100 prompts",
+        N_PROMPTS=100,
         ALPHAS=[0.25],
         MAX_NEW_TOKENS=256,
         OUTPUT_DIR="results/capping_paper",
@@ -142,29 +142,45 @@ from run_generation import FACTUAL_PROMPTS, CREATIVE_PROMPTS, PCA_PROMPTS
 # ============================================================
 
 def load_jailbreak_dataset(n_prompts=None):
-    """Load JailbreakBench JBB-Behaviors dataset from HuggingFace.
+    """Load WildJailbreak adversarial_harmful prompts from HuggingFace.
 
-    Returns a list of dicts with keys: id, goal, category.
-    The 'goal' field is the harmful behavior description used as the user prompt.
+    Uses the eval split filtered to adversarial_harmful rows — these are
+    complete jailbreak attacks (harmful goal wrapped in a jailbreak tactic
+    such as roleplay, persona modulation, fictional framing) that have been
+    shown to elicit compliance from aligned models.
+
+    Each row returns:
+        id       — row index
+        goal     — the full adversarial prompt sent to the model
+        vanilla  — the underlying harmful request (for reference/logging)
+        category — first jailbreak tactic used (e.g. "roleplay", "persona")
 
     Requires: pip install datasets
     """
     from datasets import load_dataset
     logger = logging.getLogger("capping")
-    logger.info("Loading JailbreakBench/JBB-Behaviors from HuggingFace...")
+    logger.info("Loading allenai/wildjailbreak (eval, adversarial_harmful)...")
 
-    ds = load_dataset("JailbreakBench/JBB-Behaviors", "behaviors")
-    # Dataset may have a single split or a train split
-    if hasattr(ds, "keys"):
-        split = "train" if "train" in ds else list(ds.keys())[0]
-        ds = ds[split]
+    # delimiter and keep_default_na are required for this dataset
+    ds = load_dataset(
+        "allenai/wildjailbreak", "eval",
+        delimiter="\t",
+        keep_default_na=False,
+    )
+    split = "train" if "train" in ds else list(ds.keys())[0]
+    ds = ds[split]
 
     behaviors = []
-    for row in ds:
+    for idx, row in enumerate(ds):
+        if row.get("data_type") != "adversarial_harmful":
+            continue
+        tactics = row.get("tactics", [])
+        category = tactics[0] if tactics else "unknown"
         behaviors.append({
-            "id":       row.get("BehaviorID", row.get("behavior_id", "")),
-            "goal":     row.get("Goal",       row.get("goal", "")),
-            "category": row.get("Category",   row.get("category", "unknown")),
+            "id":       idx,
+            "goal":     row["adversarial"],   # complete jailbreak attack prompt
+            "vanilla":  row.get("vanilla", ""),
+            "category": category,
         })
 
     if n_prompts is not None:
@@ -172,7 +188,7 @@ def load_jailbreak_dataset(n_prompts=None):
 
     categories = sorted(set(b["category"] for b in behaviors))
     logger.info(
-        "Loaded %d behaviors across %d categories: %s",
+        "Loaded %d adversarial_harmful prompts across %d tactic categories: %s",
         len(behaviors), len(categories), categories,
     )
     return behaviors
@@ -271,6 +287,7 @@ def main():
     behaviors = load_jailbreak_dataset(n_prompts=cfg["N_PROMPTS"])
     prompts           = [b["goal"]     for b in behaviors]
     prompt_categories = [b["category"] for b in behaviors]
+    vanilla_goals     = [b.get("vanilla", "") for b in behaviors]
     print(f"  {len(prompts)} behaviors loaded")
 
     # Apply prompt slice (for data-parallel runs across multiple GPUs)
@@ -298,6 +315,7 @@ def main():
             for axis, taus in thresholds.items()
         },
         "n_prompts":        len(prompts),
+        "dataset":          "allenai/wildjailbreak (eval, adversarial_harmful)",
         "n_calibration":    len(calibration_prompts),
         "max_new_tokens":   cfg["MAX_NEW_TOKENS"],
         "temperature":      TEMPERATURE,
@@ -306,7 +324,6 @@ def main():
         "deterministic":    DETERMINISTIC,
         "num_layers":       exp.num_layers,
         "hidden_dim":       exp.hidden_dim,
-        "dataset":          "JailbreakBench/JBB-Behaviors",
     }
     with open(output_dir / "version.json", "w") as f:
         json.dump(version_doc, f, indent=2)
