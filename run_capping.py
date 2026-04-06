@@ -315,8 +315,11 @@ def main():
         "alphas":           alphas,
         "axis_names":       list(axis_directions.keys()),
         "thresholds": {
-            axis: {str(a): v for a, v in taus.items()}
-            for axis, taus in thresholds.items()
+            axis: {
+                f"L{layer_idx}": {str(a): v for a, v in alpha_taus.items()}
+                for layer_idx, alpha_taus in layer_taus.items()
+            }
+            for axis, layer_taus in thresholds.items()
         },
         "n_prompts":        len(prompts),
         "dataset":          "allenai/wildjailbreak (eval, adversarial_harmful)",

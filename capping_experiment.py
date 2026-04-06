@@ -115,12 +115,16 @@ def compute_thresholds(
     cap_layers: list[int],
     alphas: list[float],
     max_new_tokens: int = 64,
-) -> dict[str, dict[float, float]]:
-    """Compute per-axis projection thresholds from clean calibration prompts.
+) -> dict[str, dict[int, dict[float, float]]]:
+    """Compute per-axis, per-layer projection thresholds from clean calibration prompts.
 
     Runs the model unperturbed on benign prompts, collects per-step projections
-    along each axis at cap_layers[-1] (the last and most output-proximal cap
-    layer), and returns the α-th percentile as τ for each (axis_name, alpha).
+    along each axis at every cap layer, and returns the α-th percentile as τ
+    for each (axis_name, layer_idx, alpha) triple.
+
+    Each cap layer gets its own τ because projection magnitudes grow through
+    the network — a single threshold calibrated at one layer would be wrong
+    for all others.
 
     Args:
         calibration_prompts: Benign prompts; 20-30 is typically sufficient.
@@ -129,26 +133,30 @@ def compute_thresholds(
         alphas:              Percentile values in [0.0, 1.0] (e.g. 0.25 = 25th pct).
 
     Returns:
-        thresholds[axis_name][alpha] = τ (float)
+        thresholds[axis_name][layer_idx][alpha] = τ (float)
     """
-    ref_layer = cap_layers[-1]   # calibrate at the last (most output-proximal) cap layer
     logger.info(
-        "Computing thresholds from %d calibration prompts at layer %d "
-        "(cap range: L%d–L%d)...",
-        len(calibration_prompts), ref_layer, cap_layers[0], cap_layers[-1],
+        "Computing per-layer thresholds from %d calibration prompts "
+        "(cap range: L%d–L%d, %d layers)...",
+        len(calibration_prompts), cap_layers[0], cap_layers[-1], len(cap_layers),
     )
 
-    all_projections: dict[str, list[float]] = {name: [] for name in axis_directions}
+    # all_projections[axis_name][layer_idx] = list of float across all prompts/steps
+    all_projections: dict[str, dict[int, list[float]]] = {
+        name: {layer_idx: [] for layer_idx in cap_layers}
+        for name in axis_directions
+    }
 
     for prompt in tqdm(calibration_prompts, desc="Calibration"):
         input_ids = exp.tokenize(prompt)
 
         with ExitStack() as stack:
-            trackers: dict[str, _AxisProjectionTracker] = {}
+            trackers: dict[tuple, _AxisProjectionTracker] = {}
             for axis_name, axis_unit in axis_directions.items():
-                t = _AxisProjectionTracker(exp.layers[ref_layer], axis_unit)
-                stack.enter_context(t)
-                trackers[axis_name] = t
+                for layer_idx in cap_layers:
+                    t = _AxisProjectionTracker(exp.layers[layer_idx], axis_unit)
+                    stack.enter_context(t)
+                    trackers[(axis_name, layer_idx)] = t
 
             attention_mask = torch.ones_like(input_ids)
             with torch.inference_mode():
@@ -159,23 +167,30 @@ def compute_thresholds(
                     do_sample=False,
                 )
 
-            for axis_name, tracker in trackers.items():
-                all_projections[axis_name].extend(tracker.projections)
+            for (axis_name, layer_idx), tracker in trackers.items():
+                all_projections[axis_name][layer_idx].extend(tracker.projections)
 
-    thresholds: dict[str, dict[float, float]] = {}
-    for axis_name, projections in all_projections.items():
-        arr = np.array(projections, dtype=np.float32)
-        thresholds[axis_name] = {
-            alpha: float(np.percentile(arr, alpha * 100))
-            for alpha in alphas
-        }
-        tau_str = "  ".join(
-            f"α={a:.2f}→τ={v:.1f}" for a, v in thresholds[axis_name].items()
-        )
-        logger.info(
-            "  %s: n=%d  mean=%.1f  std=%.1f  |  %s",
-            axis_name, len(arr), float(arr.mean()), float(arr.std()), tau_str,
-        )
+    thresholds: dict[str, dict[int, dict[float, float]]] = {}
+    for axis_name, layer_projs in all_projections.items():
+        thresholds[axis_name] = {}
+        for layer_idx, projections in layer_projs.items():
+            arr = np.array(projections, dtype=np.float32)
+            thresholds[axis_name][layer_idx] = {
+                alpha: float(np.percentile(arr, alpha * 100))
+                for alpha in alphas
+            }
+        # Log summary: show mean/std at first and last cap layer
+        for layer_idx in [cap_layers[0], cap_layers[-1]]:
+            arr = np.array(layer_projs[layer_idx], dtype=np.float32)
+            tau_str = "  ".join(
+                f"α={a:.2f}→τ={v:.1f}"
+                for a, v in thresholds[axis_name][layer_idx].items()
+            )
+            logger.info(
+                "  %s L%d: n=%d  mean=%.1f  std=%.1f  |  %s",
+                axis_name, layer_idx, len(arr),
+                float(arr.mean()), float(arr.std()), tau_str,
+            )
 
     return thresholds
 
@@ -239,7 +254,7 @@ def generate_capped(
     input_ids: torch.Tensor,
     cap_layers: list[int],
     axis_unit: torch.Tensor,
-    threshold: float,
+    per_layer_thresholds: dict[int, float],
     track_layers: list[int],
     max_new_tokens: int = 128,
     temperature: float = 1.0,
@@ -247,9 +262,10 @@ def generate_capped(
 ) -> tuple:
     """Generate with capping hooks active across all cap_layers simultaneously.
 
-    One _CappingHook is registered per layer in cap_layers. All hooks share
-    the same axis_unit and threshold. Hooks enter before projection trackers
-    so trackers observe the already-corrected hidden states.
+    One _CappingHook is registered per layer in cap_layers. Each hook uses
+    the τ calibrated at that specific layer (per_layer_thresholds[layer_idx]).
+    Hooks enter before projection trackers so trackers observe the
+    already-corrected hidden states.
 
     Returns:
         (sequences, scores, projs, n_interventions) where
@@ -257,7 +273,7 @@ def generate_capped(
         n_interventions = total corrections across all cap layers and all steps.
     """
     cap_hooks = [
-        _CappingHook(exp.layers[layer_idx], axis_unit, threshold)
+        _CappingHook(exp.layers[layer_idx], axis_unit, per_layer_thresholds[layer_idx])
         for layer_idx in cap_layers
     ]
 
@@ -370,20 +386,33 @@ def run_capping_experiment(
             continue
 
         # --- One condition per (axis_name, alpha), never combined ---
-        for axis_name, alpha_thresholds in thresholds.items():
+        # thresholds[axis_name][layer_idx][alpha] = τ
+        # Collect the set of alphas from the first axis (all axes share the same alphas)
+        first_axis = next(iter(thresholds))
+        alphas = list(next(iter(thresholds[first_axis].values())).keys())
+
+        for axis_name, layer_alpha_taus in thresholds.items():
             axis_unit = axis_directions[axis_name]
 
-            for alpha, tau in alpha_thresholds.items():
+            for alpha in alphas:
+                # Build per-layer threshold dict for this alpha
+                per_layer_tau = {
+                    layer_idx: layer_alpha_taus[layer_idx][alpha]
+                    for layer_idx in cap_layers
+                }
+                # Representative τ for logging/CSV: use the last cap layer
+                tau_repr = per_layer_tau[cap_layers[-1]]
+
                 cond_t0 = time.time()
                 try:
                     pt_ids, pt_scores, pt_projs, n_interventions = generate_capped(
-                        exp, input_ids, cap_layers, axis_unit, tau,
+                        exp, input_ids, cap_layers, axis_unit, per_layer_tau,
                         track_layers, max_new_tokens, temperature, do_sample,
                     )
                 except Exception:
                     logger.exception(
-                        "  FAILED %s α=%.2f τ=%.1f prompt=%d — skipping",
-                        axis_name, alpha, tau, prompt_idx,
+                        "  FAILED %s α=%.2f prompt=%d — skipping",
+                        axis_name, alpha, prompt_idx,
                     )
                     completed += 1
                     continue
@@ -395,8 +424,8 @@ def run_capping_experiment(
                 completed += 1
 
                 logger.debug(
-                    "  %s α=%.2f τ=%.1f: %d tok, %d interventions, %.1fs",
-                    axis_name, alpha, tau,
+                    "  %s α=%.2f τ(L%d)=%.1f: %d tok, %d interventions, %.1fs",
+                    axis_name, alpha, cap_layers[-1], tau_repr,
                     pt_ids.shape[1] - prompt_len, n_interventions, cond_dt,
                 )
 
@@ -407,7 +436,7 @@ def run_capping_experiment(
                     "prompt_text": prompt,
                     "direction_type": axis_name,
                     "alpha": alpha,
-                    "threshold_value": tau,
+                    "threshold_value": tau_repr,   # τ at last cap layer, for reference
                     "cap_layers": cap_layers_str,
                     "baseline_text": bl_text,
                     "perturbed_text": pt_text,
@@ -430,7 +459,7 @@ def run_capping_experiment(
                     sm["prompt_idx"] = prompt_idx
                     sm["direction_type"] = axis_name
                     sm["alpha"] = alpha
-                    sm["threshold_value"] = tau
+                    sm["threshold_value"] = tau_repr
                     sm["cap_layers"] = cap_layers_str
                     if category is not None:
                         sm["prompt_category"] = category
