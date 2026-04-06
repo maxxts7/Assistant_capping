@@ -270,7 +270,7 @@ def main():
     # Map to capping-experiment axis names
     axis_directions = {
         "assistant_capping": all_directions["assistant_toward"],
-        "pc1_flooring":      all_directions["pca_pc1_positive"],
+        "pc1_capping":       all_directions["pca_pc1_negative"],  # ceiling on pc1_positive = floor on pc1_negative
     }
     print(f"  Axis directions: {list(axis_directions.keys())}")
 
