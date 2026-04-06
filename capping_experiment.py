@@ -112,28 +112,30 @@ def compute_thresholds(
     exp: SteeringExperiment,
     calibration_prompts: list[str],
     axis_directions: dict[str, torch.Tensor],
-    target_layer: int,
+    cap_layers: list[int],
     alphas: list[float],
     max_new_tokens: int = 64,
 ) -> dict[str, dict[float, float]]:
     """Compute per-axis projection thresholds from clean calibration prompts.
 
     Runs the model unperturbed on benign prompts, collects per-step projections
-    along each axis at target_layer, and returns the α-th percentile as the
-    threshold τ for each (axis_name, alpha) pair.
+    along each axis at cap_layers[-1] (the last and most output-proximal cap
+    layer), and returns the α-th percentile as τ for each (axis_name, alpha).
 
     Args:
         calibration_prompts: Benign prompts; 20-30 is typically sufficient.
         axis_directions:     axis_name -> unit vector (float32, CPU).
-        target_layer:        Layer index where capping will be applied.
+        cap_layers:          List of layer indices where capping will be applied.
         alphas:              Percentile values in [0.0, 1.0] (e.g. 0.25 = 25th pct).
 
     Returns:
         thresholds[axis_name][alpha] = τ (float)
     """
+    ref_layer = cap_layers[-1]   # calibrate at the last (most output-proximal) cap layer
     logger.info(
-        "Computing thresholds from %d calibration prompts at layer %d...",
-        len(calibration_prompts), target_layer,
+        "Computing thresholds from %d calibration prompts at layer %d "
+        "(cap range: L%d–L%d)...",
+        len(calibration_prompts), ref_layer, cap_layers[0], cap_layers[-1],
     )
 
     all_projections: dict[str, list[float]] = {name: [] for name in axis_directions}
@@ -144,7 +146,7 @@ def compute_thresholds(
         with ExitStack() as stack:
             trackers: dict[str, _AxisProjectionTracker] = {}
             for axis_name, axis_unit in axis_directions.items():
-                t = _AxisProjectionTracker(exp.layers[target_layer], axis_unit)
+                t = _AxisProjectionTracker(exp.layers[ref_layer], axis_unit)
                 stack.enter_context(t)
                 trackers[axis_name] = t
 
@@ -235,7 +237,7 @@ def _generate_baseline_multi_axis(
 def generate_capped(
     exp: SteeringExperiment,
     input_ids: torch.Tensor,
-    cap_layer: int,
+    cap_layers: list[int],
     axis_unit: torch.Tensor,
     threshold: float,
     track_layers: list[int],
@@ -243,21 +245,26 @@ def generate_capped(
     temperature: float = 1.0,
     do_sample: bool = False,
 ) -> tuple:
-    """Generate with capping hook active at cap_layer.
+    """Generate with capping hooks active across all cap_layers simultaneously.
 
-    The capping hook fires on every decode step. The projection trackers are
-    registered after the capping hook so they observe the corrected hidden state.
+    One _CappingHook is registered per layer in cap_layers. All hooks share
+    the same axis_unit and threshold. Hooks enter before projection trackers
+    so trackers observe the already-corrected hidden states.
 
     Returns:
         (sequences, scores, projs, n_interventions) where
         projs[layer_idx] = list[float] per decode step,
-        n_interventions = number of steps where the cap actually fired.
+        n_interventions = total corrections across all cap layers and all steps.
     """
-    cap_hook = _CappingHook(exp.layers[cap_layer], axis_unit, threshold)
+    cap_hooks = [
+        _CappingHook(exp.layers[layer_idx], axis_unit, threshold)
+        for layer_idx in cap_layers
+    ]
 
     with ExitStack() as stack:
-        # Capping hook enters first — modifies activations before trackers read them
-        stack.enter_context(cap_hook)
+        # All capping hooks enter first, in ascending layer order
+        for hook in cap_hooks:
+            stack.enter_context(hook)
 
         trackers: dict[int, _AxisProjectionTracker] = {}
         for layer_idx in track_layers:
@@ -280,7 +287,8 @@ def generate_capped(
 
         projs = {layer_idx: trackers[layer_idx].projections for layer_idx in track_layers}
 
-    return output.sequences, output.scores, projs, cap_hook.n_interventions
+    n_interventions = sum(h.n_interventions for h in cap_hooks)
+    return output.sequences, output.scores, projs, n_interventions
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +298,7 @@ def generate_capped(
 def run_capping_experiment(
     exp: SteeringExperiment,
     prompts: list[str],
-    perturb_layer: int,
+    cap_layers: list[int],
     thresholds: dict[str, dict[float, float]],
     axis_directions: dict[str, torch.Tensor],
     max_new_tokens: int = 128,
@@ -319,7 +327,9 @@ def run_capping_experiment(
     step_metric_rows = []
 
     final_layer = exp.num_layers - 1
-    track_layers = sorted({perturb_layer, final_layer})
+    # Track projections at the last cap layer (exit of the capping range) and the final layer
+    track_layers = sorted({cap_layers[-1], final_layer})
+    cap_layers_str = f"L{cap_layers[0]}-L{cap_layers[-1]}"
 
     n_conditions = sum(len(alpha_map) for alpha_map in thresholds.values())
     total = len(prompts) * n_conditions
@@ -367,7 +377,7 @@ def run_capping_experiment(
                 cond_t0 = time.time()
                 try:
                     pt_ids, pt_scores, pt_projs, n_interventions = generate_capped(
-                        exp, input_ids, perturb_layer, axis_unit, tau,
+                        exp, input_ids, cap_layers, axis_unit, tau,
                         track_layers, max_new_tokens, temperature, do_sample,
                     )
                 except Exception:
@@ -398,7 +408,7 @@ def run_capping_experiment(
                     "direction_type": axis_name,
                     "alpha": alpha,
                     "threshold_value": tau,
-                    "perturb_layer": perturb_layer,
+                    "cap_layers": cap_layers_str,
                     "baseline_text": bl_text,
                     "perturbed_text": pt_text,
                     "baseline_len_tokens": bl_ids.shape[1] - prompt_len,
@@ -421,7 +431,7 @@ def run_capping_experiment(
                     sm["direction_type"] = axis_name
                     sm["alpha"] = alpha
                     sm["threshold_value"] = tau
-                    sm["perturb_layer"] = perturb_layer
+                    sm["cap_layers"] = cap_layers_str
                     if category is not None:
                         sm["prompt_category"] = category
                     # Axis projection columns — baseline uses the per-axis projs,

@@ -84,8 +84,12 @@ PRESETS = {
 
 MODEL_NAME    = "Qwen/Qwen3-32B"
 AXIS_PATH     = None    # None = auto-download from HuggingFace
-PERTURB_LAYER = None    # None = use model's default target_layer (32 for Qwen3-32B)
 DETERMINISTIC = True
+
+# Layer range for capping — upper quarter of the network, as per the paper.
+# For Qwen3-32B (64 layers): L46–L53  (8 layers, ~72–84% depth)
+# For Llama 3.3 70B (80 layers): L56–L71  (16 layers, ~70–90% depth)
+CAP_LAYERS = list(range(46, 54))
 SEED          = 42
 TEMPERATURE   = 1.0
 DO_SAMPLE     = False
@@ -242,8 +246,8 @@ def main():
     exp = SteeringExperiment(MODEL_NAME, axis_path=AXIS_PATH, deterministic=DETERMINISTIC)
     print(f"  Layers: {exp.num_layers}, Hidden dim: {exp.hidden_dim}")
 
-    perturb_layer = PERTURB_LAYER if PERTURB_LAYER is not None else MODEL_CONFIGS[MODEL_NAME]["target_layer"]
-    print(f"  Perturb layer: {perturb_layer}")
+    cap_layers = CAP_LAYERS
+    print(f"  Cap layers: L{cap_layers[0]}–L{cap_layers[-1]} ({len(cap_layers)} layers)")
 
     # --- Compute directions ---
     # assistant_toward: positive assistant-axis direction (unit vector)
@@ -251,7 +255,7 @@ def main():
     print("\nComputing directions...")
     all_directions = compute_directions(
         exp,
-        target_layer=perturb_layer,
+        target_layer=cap_layers[-1],   # use last cap layer as the representative layer
         n_random_dirs=0,
         seed=SEED,
         factual_prompts=FACTUAL_PROMPTS,
@@ -278,7 +282,7 @@ def main():
         exp,
         calibration_prompts=calibration_prompts,
         axis_directions=axis_directions,
-        target_layer=perturb_layer,
+        cap_layers=cap_layers,
         alphas=alphas,
     )
 
@@ -307,7 +311,7 @@ def main():
         "notes":            cfg["VERSION_NOTES"],
         "timestamp":        datetime.now().isoformat(),
         "model_name":       MODEL_NAME,
-        "perturb_layer":    perturb_layer,
+        "cap_layers":       f"L{cap_layers[0]}-L{cap_layers[-1]}",
         "alphas":           alphas,
         "axis_names":       list(axis_directions.keys()),
         "thresholds": {
@@ -334,7 +338,7 @@ def main():
     gen_df, step_df = run_capping_experiment(
         exp=exp,
         prompts=prompts,
-        perturb_layer=perturb_layer,
+        cap_layers=cap_layers,
         thresholds=thresholds,
         axis_directions=axis_directions,
         max_new_tokens=cfg["MAX_NEW_TOKENS"],
