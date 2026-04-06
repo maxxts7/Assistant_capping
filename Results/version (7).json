@@ -1,0 +1,44 @@
+{
+  "version": "focused_v1",
+  "preset": "focused",
+  "notes": "Focused run \u2014 6 directions, per-mode alphas (persistent=1.5, oneshot=3.5)",
+  "timestamp": "2026-04-06T09:37:14.884586",
+  "model_name": "Qwen/Qwen3-32B",
+  "perturb_layer": 32,
+  "alphas": {
+    "persistent": [
+      1.5
+    ],
+    "oneshot": [
+      3.5
+    ]
+  },
+  "perturb_modes": [
+    "persistent",
+    "oneshot"
+  ],
+  "directions": [
+    "assistant_away",
+    "assistant_toward",
+    "fc_positive",
+    "fc_negative",
+    "pca_pc1_positive",
+    "pca_pc1_negative"
+  ],
+  "max_new_tokens": 128,
+  "temperature": 1.0,
+  "do_sample": false,
+  "seed": 42,
+  "deterministic": true,
+  "n_prompts": 50,
+  "n_random_dirs": 0,
+  "enable_assistant": true,
+  "enable_random": false,
+  "enable_fc": true,
+  "enable_pca": true,
+  "num_layers": 64,
+  "hidden_dim": 5120,
+  "n_factual_prompts": 15,
+  "n_creative_prompts": 15,
+  "n_pca_prompts": 60
+}

@@ -7,11 +7,19 @@ from pathlib import Path
 import pandas as pd
 
 OUTPUT_DIRS = {
-    "sanity":   "results/generation_sanity",
-    "thorough": "results/generation_thorough",
-    "full":     "results/generation",
+    # generation experiment
+    "sanity":           "results/generation_sanity",
+    "thorough":         "results/generation_thorough",
+    "full":             "results/generation",
+    "focused":          "results/generation_focused",
+    # capping experiment
+    "cap_sanity":       "results/capping_sanity",
+    "cap_light":        "results/capping_light",
+    "cap_full":         "results/capping_full",
+    "cap_paper":        "results/capping_paper",
 }
 
+# Columns present in all experiments; missing ones are skipped gracefully
 SORT_COLS = ["prompt_idx", "direction_type", "alpha", "perturb_mode", "step"]
 
 
