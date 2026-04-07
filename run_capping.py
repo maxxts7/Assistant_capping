@@ -80,6 +80,18 @@ PRESETS = {
         N_CALIBRATION=30,
         N_COMPLIANCE=50,
     ),
+    "light_raw": dict(
+        VERSION="light_raw",
+        VERSION_NOTES="Raw axes only — skips orthogonalized compliance/PC1 variants. "
+                      "Run alongside light to compare raw vs orthogonalized.",
+        N_PROMPTS=20,
+        ALPHAS=[0.1, 0.25, 0.5],
+        MAX_NEW_TOKENS=128,
+        OUTPUT_DIR="results/capping_light_raw",
+        N_CALIBRATION=20,
+        N_COMPLIANCE=20,
+        SKIP_ORTHOGONALIZED=True,
+    ),
 }
 
 # ============================================================
@@ -327,12 +339,13 @@ def main():
         enable_pca=True,
     )
 
+    skip_ortho = cfg.get("SKIP_ORTHOGONALIZED", False)
+
     # Map to capping-experiment axis names
     assistant_axis = all_directions["assistant_toward"]
-    axis_directions = {
-        "assistant_capping": assistant_axis,
-        "pc1_capping":       all_directions["pca_pc1_negative"],  # orthogonalized against assistant axis
-    }
+    axis_directions = {"assistant_capping": assistant_axis}
+    if not skip_ortho:
+        axis_directions["pc1_capping"] = all_directions["pca_pc1_negative"]  # orthogonalized
 
     # Raw PC1 (no orthogonalization) — compute_directions() always orthogonalizes
     # PC1 against the assistant axis internally, so we run PCA directly here.
@@ -365,20 +378,20 @@ def main():
     compliant_wj      = load_wildjailbreak_train(n_prompts=n_compliance)
     compliant_cal     = CALIBRATION_PROMPTS[:n_compliance]
 
-    # Orthogonalized variants (assistant component removed)
-    jbb_wj_axis = compute_compliance_axis(
-        exp, refusing_prompts, compliant_wj, cap_layers,
-        assistant_axis=assistant_axis, axis_name="jbb_wj",
-    )
-    jbb_cal_axis = compute_compliance_axis(
-        exp, refusing_prompts, compliant_cal, cap_layers,
-        assistant_axis=assistant_axis, axis_name="jbb_cal",
-    )
-
-    if jbb_wj_axis is not None:
-        axis_directions["jbb_wj_compliance"]  = jbb_wj_axis
-    if jbb_cal_axis is not None:
-        axis_directions["jbb_cal_compliance"] = jbb_cal_axis
+    # Orthogonalized variants (assistant component removed) — skipped in light_raw preset
+    if not skip_ortho:
+        jbb_wj_axis = compute_compliance_axis(
+            exp, refusing_prompts, compliant_wj, cap_layers,
+            assistant_axis=assistant_axis, axis_name="jbb_wj",
+        )
+        jbb_cal_axis = compute_compliance_axis(
+            exp, refusing_prompts, compliant_cal, cap_layers,
+            assistant_axis=assistant_axis, axis_name="jbb_cal",
+        )
+        if jbb_wj_axis is not None:
+            axis_directions["jbb_wj_compliance"]  = jbb_wj_axis
+        if jbb_cal_axis is not None:
+            axis_directions["jbb_cal_compliance"] = jbb_cal_axis
 
     # Raw variants (no orthogonalization) — keeps the assistant-aligned component.
     # If the raw direction had high cos(assistant), orthogonalizing destroys its
@@ -401,20 +414,20 @@ def main():
     if jbb_cal_raw_axis is not None:
         axis_directions["jbb_cal_raw"] = jbb_cal_raw_axis
 
-    # PCA-based compliance axes (orthogonalized)
-    jbb_wj_pca_axis = compute_pca_compliance_axis(
-        exp, refusing_prompts, compliant_wj, cap_layers,
-        assistant_axis=assistant_axis, axis_name="jbb_wj_pca",
-    )
-    jbb_cal_pca_axis = compute_pca_compliance_axis(
-        exp, refusing_prompts, compliant_cal, cap_layers,
-        assistant_axis=assistant_axis, axis_name="jbb_cal_pca",
-    )
-
-    if jbb_wj_pca_axis is not None:
-        axis_directions["jbb_wj_pca"]  = jbb_wj_pca_axis
-    if jbb_cal_pca_axis is not None:
-        axis_directions["jbb_cal_pca"] = jbb_cal_pca_axis
+    # PCA-based compliance axes (orthogonalized) — skipped in light_raw preset
+    if not skip_ortho:
+        jbb_wj_pca_axis = compute_pca_compliance_axis(
+            exp, refusing_prompts, compliant_wj, cap_layers,
+            assistant_axis=assistant_axis, axis_name="jbb_wj_pca",
+        )
+        jbb_cal_pca_axis = compute_pca_compliance_axis(
+            exp, refusing_prompts, compliant_cal, cap_layers,
+            assistant_axis=assistant_axis, axis_name="jbb_cal_pca",
+        )
+        if jbb_wj_pca_axis is not None:
+            axis_directions["jbb_wj_pca"]  = jbb_wj_pca_axis
+        if jbb_cal_pca_axis is not None:
+            axis_directions["jbb_cal_pca"] = jbb_cal_pca_axis
 
     # PCA-based raw variants (no orthogonalization)
     jbb_wj_pca_raw_axis = compute_pca_compliance_axis(

@@ -17,6 +17,7 @@ OUTPUT_DIRS = {
     "cap_light":        "results/capping_light",
     "cap_full":         "results/capping_full",
     "cap_paper":        "results/capping_paper",
+    "cap_light_raw":    "results/capping_light_raw",
 }
 
 # Columns present in all experiments; missing ones are skipped gracefully
