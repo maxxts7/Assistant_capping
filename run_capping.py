@@ -346,6 +346,7 @@ def main():
     compliant_wj      = load_wildjailbreak_train(n_prompts=n_compliance)
     compliant_cal     = CALIBRATION_PROMPTS[:n_compliance]
 
+    # Orthogonalized variants (assistant component removed)
     jbb_wj_axis = compute_compliance_axis(
         exp, refusing_prompts, compliant_wj, cap_layers,
         assistant_axis=assistant_axis, axis_name="jbb_wj",
@@ -360,8 +361,28 @@ def main():
     if jbb_cal_axis is not None:
         axis_directions["jbb_cal_compliance"] = jbb_cal_axis
 
-    # PCA-based compliance axes — PC1 of pooled (JBB + compliant) activations.
-    # More robust than mean contrast when within-group variance is high.
+    # Raw variants (no orthogonalization) — keeps the assistant-aligned component.
+    # If the raw direction had high cos(assistant), orthogonalizing destroys its
+    # discriminative power. These let us test whether that component matters.
+    jbb_wj_raw_axis = compute_compliance_axis(
+        exp, refusing_prompts, compliant_wj, cap_layers,
+        assistant_axis=None, axis_name="jbb_wj_raw",
+    )
+    jbb_cal_raw_axis = compute_compliance_axis(
+        exp, refusing_prompts, compliant_cal, cap_layers,
+        assistant_axis=None, axis_name="jbb_cal_raw",
+    )
+
+    if jbb_wj_raw_axis is not None:
+        # Log cos(assistant) for the raw direction so we can see the overlap
+        cos_wj  = (jbb_wj_raw_axis  @ assistant_axis).item()
+        cos_cal = (jbb_cal_raw_axis @ assistant_axis).item() if jbb_cal_raw_axis is not None else None
+        print(f"  Raw compliance cos(assistant): jbb_wj={cos_wj:.4f}  jbb_cal={cos_cal:.4f}")
+        axis_directions["jbb_wj_raw"]  = jbb_wj_raw_axis
+    if jbb_cal_raw_axis is not None:
+        axis_directions["jbb_cal_raw"] = jbb_cal_raw_axis
+
+    # PCA-based compliance axes (orthogonalized)
     jbb_wj_pca_axis = compute_pca_compliance_axis(
         exp, refusing_prompts, compliant_wj, cap_layers,
         assistant_axis=assistant_axis, axis_name="jbb_wj_pca",
@@ -375,6 +396,24 @@ def main():
         axis_directions["jbb_wj_pca"]  = jbb_wj_pca_axis
     if jbb_cal_pca_axis is not None:
         axis_directions["jbb_cal_pca"] = jbb_cal_pca_axis
+
+    # PCA-based raw variants (no orthogonalization)
+    jbb_wj_pca_raw_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, compliant_wj, cap_layers,
+        assistant_axis=None, axis_name="jbb_wj_pca_raw",
+    )
+    jbb_cal_pca_raw_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, compliant_cal, cap_layers,
+        assistant_axis=None, axis_name="jbb_cal_pca_raw",
+    )
+
+    if jbb_wj_pca_raw_axis is not None:
+        cos_wj_pca  = (jbb_wj_pca_raw_axis  @ assistant_axis).item()
+        cos_cal_pca = (jbb_cal_pca_raw_axis @ assistant_axis).item() if jbb_cal_pca_raw_axis is not None else None
+        print(f"  Raw PCA cos(assistant): jbb_wj_pca={cos_wj_pca:.4f}  jbb_cal_pca={cos_cal_pca:.4f}")
+        axis_directions["jbb_wj_pca_raw"]  = jbb_wj_pca_raw_axis
+    if jbb_cal_pca_raw_axis is not None:
+        axis_directions["jbb_cal_pca_raw"] = jbb_cal_pca_raw_axis
 
     print(f"  Axis directions: {list(axis_directions.keys())}")
 
