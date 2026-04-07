@@ -294,7 +294,8 @@ def main():
     from generation_experiment import SteeringExperiment, compute_directions, MODEL_CONFIGS
     from capping_experiment import (
         compute_thresholds, compute_discriminative_thresholds,
-        run_capping_experiment, compute_compliance_axis, run_capability_eval,
+        run_capping_experiment, compute_compliance_axis,
+        compute_pca_compliance_axis, run_capability_eval,
     )
 
     output_dir = Path(args.output_dir or cfg["OUTPUT_DIR"])
@@ -358,6 +359,22 @@ def main():
         axis_directions["jbb_wj_compliance"]  = jbb_wj_axis
     if jbb_cal_axis is not None:
         axis_directions["jbb_cal_compliance"] = jbb_cal_axis
+
+    # PCA-based compliance axes — PC1 of pooled (JBB + compliant) activations.
+    # More robust than mean contrast when within-group variance is high.
+    jbb_wj_pca_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, compliant_wj, cap_layers,
+        assistant_axis=assistant_axis, axis_name="jbb_wj_pca",
+    )
+    jbb_cal_pca_axis = compute_pca_compliance_axis(
+        exp, refusing_prompts, compliant_cal, cap_layers,
+        assistant_axis=assistant_axis, axis_name="jbb_cal_pca",
+    )
+
+    if jbb_wj_pca_axis is not None:
+        axis_directions["jbb_wj_pca"]  = jbb_wj_pca_axis
+    if jbb_cal_pca_axis is not None:
+        axis_directions["jbb_cal_pca"] = jbb_cal_pca_axis
 
     print(f"  Axis directions: {list(axis_directions.keys())}")
 

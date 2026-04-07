@@ -375,6 +375,85 @@ def compute_compliance_axis(
     return direction.cpu()
 
 
+def compute_pca_compliance_axis(
+    exp: SteeringExperiment,
+    refusing_prompts: list[str],
+    compliant_prompts: list[str],
+    cap_layers: list[int],
+    assistant_axis: Optional[torch.Tensor] = None,
+    axis_name: str = "pca_compliance",
+) -> torch.Tensor:
+    """Compute compliance direction via PCA on pooled refusing + compliant activations.
+
+    Stacks activations from both groups into one matrix, centers globally, and
+    runs SVD. PC1 captures the dominant axis of variation across both groups —
+    if compliance vs refusal is the largest source of variance, PC1 aligns with
+    that dimension.
+
+    Sign is fixed so PC1 always points from compliant toward refusing
+    (dot product with mean_refusing - mean_compliant must be positive).
+
+    Compared to compute_compliance_axis() (mean contrast):
+    - Mean contrast captures average displacement, sensitive to outliers
+    - PCA captures dominant variance direction, more robust to within-group noise
+
+    Optionally orthogonalized against the assistant axis.
+    """
+    ref_layer = cap_layers[-1]
+    logger.info(
+        "Computing %s PCA compliance axis at L%d (%d refusing, %d compliant)...",
+        axis_name, ref_layer, len(refusing_prompts), len(compliant_prompts),
+    )
+
+    refusing_acts, compliant_acts = [], []
+
+    for prompt in tqdm(refusing_prompts, desc=f"  {axis_name} refusing", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        refusing_acts.append(acts[ref_layer].float())
+
+    for prompt in tqdm(compliant_prompts, desc=f"  {axis_name} compliant", leave=False):
+        ids = exp.tokenize(prompt)
+        acts, _ = exp.get_baseline_trajectory(ids)
+        compliant_acts.append(acts[ref_layer].float())
+
+    refusing_stack  = torch.stack(refusing_acts)    # (n_refusing, hidden_dim)
+    compliant_stack = torch.stack(compliant_acts)   # (n_compliant, hidden_dim)
+    pooled = torch.cat([refusing_stack, compliant_stack], dim=0)  # (N, hidden_dim)
+
+    # Center globally and run SVD
+    pooled_centered = pooled - pooled.mean(dim=0)
+    _, _, Vt = torch.linalg.svd(pooled_centered, full_matrices=False)
+    pc1 = Vt[0].float()
+
+    # Fix sign: PC1 should point from compliant → refusing
+    mean_diff = refusing_stack.mean(0) - compliant_stack.mean(0)
+    if (pc1 @ mean_diff).item() < 0:
+        pc1 = -pc1
+
+    # Variance explained
+    U, S, _ = torch.linalg.svd(pooled_centered, full_matrices=False)
+    var_explained = (S[0] ** 2 / (S ** 2).sum()).item() * 100
+
+    cos_before = None
+    if assistant_axis is not None:
+        cos_before = (pc1 @ assistant_axis).item()
+        pc1 = pc1 - (pc1 @ assistant_axis) * assistant_axis
+        if pc1.norm().item() < 1e-6:
+            logger.warning("  %s collapsed after orthogonalization", axis_name)
+            return None
+        pc1 = pc1 / pc1.norm()
+        cos_after = (pc1 @ assistant_axis).item()
+        logger.info(
+            "  %s: var_explained=%.1f%%  cos(assistant) before=%.4f, after=%.6f",
+            axis_name, var_explained, cos_before, cos_after,
+        )
+    else:
+        logger.info("  %s: var_explained=%.1f%%", axis_name, var_explained)
+
+    return pc1.cpu()
+
+
 # ---------------------------------------------------------------------------
 # Generation functions
 # ---------------------------------------------------------------------------
