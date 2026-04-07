@@ -241,6 +241,167 @@ These need the thorough and full runs to address:
 
 ---
 
+## 9. Jailbreak Capping Experiment
+
+### Goal
+
+Test whether activation capping — constraining hidden-state projections along specific axes during generation — can prevent jailbreak attacks from inducing compliance. If a jailbreak works by suppressing the model's "assistant mode" activations, forcing those activations above a threshold should restore refusal behaviour.
+
+This is a new independent experiment (`capping_experiment.py` + `run_capping.py`), separate from the perturbation experiment above. Same metrics, same CSV schema, different mechanism: instead of perturbing activations additively, we clamp them to a minimum projection floor.
+
+### Capping mechanism
+
+The hook formula (applied at every decode step):
+
+```
+h ← h − v · min(⟨h, v⟩ − τ, 0)
+```
+
+Fires only when `⟨h, v⟩ < τ` — adds exactly enough to restore the projection to τ. No effect when the projection is already above the threshold.
+
+**Multi-layer design**: The paper caps 8 layers simultaneously (L46–L53 for Qwen3-32B — the upper quarter of the 64-layer network). Single-layer capping at L32 fired constantly (~90% of steps) but produced no output change: downstream layers (L33–L63) absorbed and undid the correction within the same forward pass. Multi-layer capping at L46–L53 applies corrections closer to the output logits, where the network has less capacity to undo them.
+
+### Dataset
+
+**JailbreakBench (JBB-Behaviors)**: bare harmful goal descriptions. Qwen3-32B refused all of them directly — no jailbreak attack wrapper, so the safety training trivially kicks in. Useful for axis construction (provides refusal-state activations) but not for evaluation.
+
+**WildJailbreak (`allenai/wildjailbreak`, eval, `adversarial_harmful`)**: complete jailbreak attacks embedding harmful goals in roleplay/persona/fictional framing. These elicit compliance from Qwen3-32B at ~60–65% rate. Used for evaluation throughout.
+
+**WildJailbreak train split**: used for compliance axis construction (jailbreak-compliant activations) without contaminating the eval split.
+
+---
+
+### Experiment 1: Single-layer capping at L32 (light preset)
+
+**Result**: Capping fired on 77–93% of decode steps but output was nearly identical to baseline. Refusal rate unchanged.
+
+**Root cause**: L32 is mid-network. Downstream layers (L33–L63) actively restore activations toward the default attractor — confirmed by the perturbation experiment's L63 convergence finding. A correction at L32 is absorbed before it affects output logits.
+
+**Fix**: switch to multi-layer capping at L46–L53.
+
+---
+
+### Experiment 2: Multi-layer capping at L46–L53 (light3, safety presets)
+
+**Configuration**: 4 axes, 3 alphas (0.1, 0.25, 0.5), 20 prompts, L46–L53.
+
+**Axes**:
+- `assistant_capping` — paper's pre-computed assistant direction (`assistant_toward`)
+- `pc1_capping` — PC1 of benign PCA prompts, orthogonalized against assistant axis (using `pca_pc1_negative` to enforce a ceiling rather than a floor)
+- `jbb_wj_compliance` — mean(JBB activations) − mean(WildJailbreak train activations), orthogonalized against assistant
+- `jbb_cal_compliance` — mean(JBB activations) − mean(CALIBRATION_PROMPTS), orthogonalized against assistant
+
+**Threshold (alpha-based)**: τ = α-th percentile of benign calibration projections at each cap layer. Computed independently per layer, so L46 gets its own τ and L53 gets its own.
+
+**Results (safety run)**:
+
+| Axis | Refusal rate | Interventions (jailbreak) | Interventions (benign) | Selectivity |
+|------|:------------:|:-------------------------:|:----------------------:|:-----------:|
+| assistant_capping | 45% | 718.5 | 311.6 | **2.31×** |
+| jbb_wj_compliance | 56% | 480.7 | 622.8 | 0.77× |
+| jbb_wj_pca | 58% | 466.0 | 619.5 | 0.75× |
+| jbb_cal_compliance | 42% | 426.4 | 697.5 | 0.61× |
+| pc1_capping | 35% | 164.1 | 253.8 | 0.65× |
+
+Baseline refusal rate: 35%.
+
+**Problem identified**: alpha-based thresholds were miscalibrated. For `assistant_capping`, τ(α=0.25) = +11 at L53, but the jailbreak-refusing distribution had mean = −11.8. The threshold sat *above* the refusing distribution mean — so the cap fired indiscriminately on both compliant and refusing jailbreak prompts, destroying selectivity.
+
+---
+
+### Experiment 3: Discriminative midpoint thresholds
+
+**Core insight**: alpha percentiles of the benign distribution set τ within the benign distribution, which may be far from the gap between benign and jailbreak distributions. The right τ is the midpoint between the two distributions:
+
+```
+τ = (mean_benign + mean_jailbreak) / 2
+```
+
+This places the threshold precisely in the gap, maximally separating the two distributions.
+
+**Calibration**: benign side = CALIBRATION_PROMPTS; jailbreak side = WildJailbreak train split (separate from eval, no contamination).
+
+**Separation at L53 (from version.json)**:
+
+| Axis | Benign mean | Jailbreak mean | Separation | τ |
+|------|:-----------:|:--------------:|:----------:|:--:|
+| assistant_capping | +47.3 | −47.0 | **+94.4** | +0.1 |
+| jbb_wj_compliance | −107.4 | −117.2 | +9.8 | −112.3 |
+| jbb_cal_compliance | −87.5 | −47.4 | −40.1 | −67.4 |
+| pc1_capping | +63.6 | +79.8 | −16.2 | +71.7 |
+
+**Key findings**:
+
+1. **assistant_capping has 94-unit separation** with distributions on opposite sides of zero. The midpoint threshold (τ ≈ 0) correctly discriminates.
+
+2. **jbb_wj_compliance/pca has only 9-unit separation** with 33–51-unit standard deviations. The two distributions almost completely overlap — no threshold will cleanly separate them. JBB (refusing) and WildJailbreak-train (compliant) project nearly identically on this axis. Processing harmful content produces similar activations regardless of whether the model refuses or complies.
+
+3. **jbb_cal_compliance/pca has inverted separation** (−40): jailbreak prompts project *higher* than benign prompts. The threshold fires on benign and misses jailbreaks entirely. Root cause: this axis = mean(JBB) − mean(calibration), pointing from calibration toward JBB (refusing). WildJailbreak-train compliant prompts are closer to JBB than calibration on this axis, placing them above τ.
+
+4. **pc1_capping is also inverted**: jailbreak prompts project higher than benign on `pca_pc1_negative`. The floor fires on benign prompts and leaves jailbreaks untouched.
+
+**Capability evaluation (benign prompts)**:
+
+| Axis | False refusals | Interventions (benign) |
+|------|:--------------:|:----------------------:|
+| assistant_capping | 5% | 311.6 |
+| jbb_wj_compliance | 10% | 622.8 |
+| jbb_cal_compliance | 9% | 697.5 |
+| pc1_capping | 0% | 253.8 |
+
+`assistant_capping` is the only axis with acceptable capability cost (5% false refusals, 2.3× selectivity).
+
+---
+
+### Experiment 4: PCA compliance axes
+
+**Hypothesis**: the mean contrast direction (jbb_wj/jbb_cal) is sensitive to within-group noise. PCA on the *pooled* matrix of [refusing + compliant] activations finds the direction of maximum variance across both groups — more robust if within-group noise is high.
+
+**Method**: stack JBB + WJ_train activations, center globally, SVD. PC1 sign fixed so it points from compliant toward refusing.
+
+**Result**: essentially identical to mean contrast axes. Separation values and intervention rates are nearly the same as `jbb_wj_compliance`/`jbb_cal_compliance`. The robustness argument doesn't help when the fundamental problem is that the two groups overlap in activation space.
+
+---
+
+### Core finding: the compliance axes are not selective because they are orthogonalized
+
+All compliance axes were orthogonalized against the assistant axis before use. This removes any component that overlaps with the assistant direction. The separation analysis reveals why this is fatal:
+
+- **assistant_capping**: 94-unit separation — the assistant axis is the primary discriminator
+- **compliance axes after orthogonalization**: ~9-unit separation — what remains after removing the assistant component has almost no discriminative power
+
+**Implication**: the component of jbb_wj_compliance that overlapped with the assistant axis was carrying most of the discriminative signal. After orthogonalization, what's left is orthogonal to the assistant axis and also orthogonal to the main compliance dimension.
+
+**Next test**: add raw (non-orthogonalized) variants of all compliance axes and measure cos(assistant) before orthogonalization. If the raw cosine is high (>0.5), the compliance axes are approximately the assistant axis and orthogonalizing was discarding the useful part. This would confirm that the compliance/refusal dimension is almost entirely encoded in the assistant axis.
+
+---
+
+### Why the assistant axis still doesn't fully work
+
+Even with correct discriminative thresholds and 94-unit separation, `assistant_capping` flips only ~9/13 compliant prompts to refusal (69%). The remaining 4 prompts comply despite activations being forcibly shifted by +94 units at L53.
+
+Two hypotheses:
+
+1. **Last-token projection is insufficient**: the capping hook only corrects the last-token hidden state at each decode step. The model attends to all previous tokens — if earlier positions encode "comply with this jailbreak", correcting the last-token projection may not override the full attention pattern.
+
+2. **Compliance is multi-dimensional**: the jailbreak might exploit multiple dimensions simultaneously. Correcting one axis (assistant projection) partially undoes one dimension of the jailbreak, but doesn't address others.
+
+---
+
+## 10. Open Questions (Jailbreak Capping)
+
+- **Do the raw (non-orthogonalized) compliance axes work?** If cos(assistant, raw_compliance) is high, they are approximately the assistant axis and should perform similarly. If it's low, they genuinely capture different signal — but the separation data suggests that signal is weak.
+
+- **Why does capping fail on the remaining 4/13 compliant prompts?** Are those prompts using a qualitatively different attack tactic that activates a different compliance pathway?
+
+- **Is correcting only the last token sufficient?** The jailbreak context is in the prefix — all previous token positions carry the attack. Correcting only the final token's representation at each step may be insufficient to override the full context.
+
+- **What is the right layer range?** L46–L53 is from the paper for Qwen3-32B. Is there a better range? Would capping at L60–L63 (very close to output) be more effective, at the cost of less recovery time?
+
+- **Can we find the exact prompts that bypass capping and analyze what's different about their activations?**
+
+---
+
 ## Appendix: Run Configs
 
 ### Run 1: Sanity Check
