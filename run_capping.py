@@ -331,8 +331,27 @@ def main():
     assistant_axis = all_directions["assistant_toward"]
     axis_directions = {
         "assistant_capping": assistant_axis,
-        "pc1_capping":       all_directions["pca_pc1_negative"],  # ceiling on pc1_positive = floor on pc1_negative
+        "pc1_capping":       all_directions["pca_pc1_negative"],  # orthogonalized against assistant axis
     }
+
+    # Raw PC1 (no orthogonalization) — compute_directions() always orthogonalizes
+    # PC1 against the assistant axis internally, so we run PCA directly here.
+    print("\nComputing raw (non-orthogonalized) PC1...")
+    import torch as _torch
+    from tqdm import tqdm as _tqdm
+    _pca_acts = []
+    for _p in _tqdm(PCA_PROMPTS, desc="  Raw PC1", leave=False):
+        _ids = exp.tokenize(_p)
+        _acts, _ = exp.get_baseline_trajectory(_ids)
+        _pca_acts.append(_acts[cap_layers[-1]].float())
+    _act_matrix = _torch.stack(_pca_acts).float()
+    _act_centered = _act_matrix - _act_matrix.mean(dim=0)
+    _, _S, _Vt = _torch.linalg.svd(_act_centered, full_matrices=False)
+    raw_pc1 = _Vt[0].cpu()
+    raw_pc1_var = (_S[0] ** 2 / (_S ** 2).sum()).item() * 100
+    cos_pc1_assistant = (raw_pc1 @ assistant_axis).item()
+    print(f"  Raw PC1: var_explained={raw_pc1_var:.1f}%  cos(assistant)={cos_pc1_assistant:.4f}")
+    axis_directions["pc1_raw"] = -raw_pc1   # ceiling on pc1_positive = floor on pc1_negative
 
     # --- Compliance axes ---
     # Two variants, both using JBB-Behaviors as the refusing side:
