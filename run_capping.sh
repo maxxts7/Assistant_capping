@@ -11,6 +11,7 @@
 #   light    20 behaviors, α ∈ {0.1, 0.25, 0.5}
 #   full     100 behaviors, α ∈ {0.1, 0.25, 0.5, 0.75}
 #   paper    100 behaviors, α=0.25 only
+#   cal_inv  20 behaviors, jbb_cal_raw_inv axis only (polarity-fix test)
 
 set -euo pipefail
 
@@ -28,10 +29,11 @@ fi
 # ── Multi-GPU parallel ───────────────────────────────────────────────────────
 # Divide behaviors evenly; last shard takes any remainder.
 case "$PRESET" in
-    sanity) N_TOTAL=5   ;;
-    light)  N_TOTAL=20  ;;
-    full)   N_TOTAL=100 ;;
-    paper)  N_TOTAL=100 ;;
+    sanity)  N_TOTAL=5   ;;
+    light)   N_TOTAL=20  ;;
+    full)    N_TOTAL=100 ;;
+    paper)   N_TOTAL=100 ;;
+    cal_inv) N_TOTAL=20  ;;
     *) echo "Unknown preset: $PRESET"; exit 1 ;;
 esac
 

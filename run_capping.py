@@ -17,6 +17,7 @@ Presets
   light    20 behaviors, α ∈ {0.1, 0.25, 0.5} — quick threshold comparison
   full     all 100 behaviors, α ∈ {0.1, 0.25, 0.5, 0.75} — complete sweep
   paper    all 100 behaviors, α=0.25 only — exact paper replication setting
+  cal_inv  20 behaviors, jbb_cal_raw_inv only — polarity-inverted cal axis test
 
 Run with:
     python run_capping.py [--preset sanity|light|full|paper] [--gpu N]
@@ -80,9 +81,25 @@ PRESETS = {
         N_CALIBRATION=30,
         N_COMPLIANCE=50,
     ),
+    "cal_inv": dict(
+        VERSION="cal_inv",
+        VERSION_NOTES="Polarity-inverted jbb_cal axis only. Tests whether negating "
+                      "jbb_cal_raw (so jailbreaks land below the threshold) improves "
+                      "selectivity and refusal rate over the original broken-polarity axis.",
+        N_PROMPTS=20,
+        ALPHAS=[0.1, 0.25, 0.5],
+        MAX_NEW_TOKENS=128,
+        OUTPUT_DIR="results/capping_cal_inv",
+        N_CALIBRATION=20,
+        N_COMPLIANCE=20,
+        SKIP_ORTHOGONALIZED=True,
+        AXES=["jbb_cal_raw_inv"],
+        THRESHOLD_TYPES=["optimal"],
+    ),
     "light_raw": dict(
         VERSION="light_raw",
         VERSION_NOTES="Raw axes only — skips orthogonalized compliance/PC1 variants. "
+                      "Includes jbb_cal_raw_inv (negated jbb_cal_raw) to test polarity fix. "
                       "Run alongside light to compare raw vs orthogonalized.",
         N_PROMPTS=20,
         ALPHAS=[0.1, 0.25, 0.5],
@@ -413,6 +430,11 @@ def main():
         axis_directions["jbb_wj_raw"]  = jbb_wj_raw_axis
     if jbb_cal_raw_axis is not None:
         axis_directions["jbb_cal_raw"] = jbb_cal_raw_axis
+        # Inverted variant: jailbreaks project higher than benign on the raw axis
+        # (both are harmful-content inputs, so they cluster on the JBB side).
+        # Negating flips the polarity so jailbreaks land below the threshold and
+        # the cap fires on them rather than on benign prompts.
+        axis_directions["jbb_cal_raw_inv"] = -jbb_cal_raw_axis
 
     # PCA-based compliance axes (orthogonalized) — skipped in light_raw preset
     if not skip_ortho:
@@ -447,6 +469,10 @@ def main():
     if jbb_cal_pca_raw_axis is not None:
         axis_directions["jbb_cal_pca_raw"] = jbb_cal_pca_raw_axis
 
+    # Optional allowlist — restrict to a named subset of axes
+    if "AXES" in cfg:
+        axis_directions = {k: v for k, v in axis_directions.items() if k in cfg["AXES"]}
+
     print(f"  Axis directions: {list(axis_directions.keys())}")
 
     # --- Compute discriminative thresholds ---
@@ -464,6 +490,16 @@ def main():
         axis_directions=axis_directions,
         cap_layers=cap_layers,
     )
+
+    if "THRESHOLD_TYPES" in cfg:
+        keep = set(cfg["THRESHOLD_TYPES"])
+        thresholds = {
+            axis: {
+                layer_idx: {t: v for t, v in layer_data.items() if t in keep}
+                for layer_idx, layer_data in layer_taus.items()
+            }
+            for axis, layer_taus in thresholds.items()
+        }
 
     # --- Load jailbreak dataset ---
     print("\nLoading jailbreak dataset...")
