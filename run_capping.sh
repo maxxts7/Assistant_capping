@@ -2,8 +2,9 @@
 # Run the jailbreak capping experiment.
 #
 # Usage:
-#   ./run_capping.sh <preset>          # single GPU (default: full)
-#   ./run_capping.sh <preset> 0 1      # 2 GPUs in parallel, merged afterwards
+#   ./run_capping.sh <preset>               # single GPU
+#   ./run_capping.sh <preset> 0 1           # 2 GPUs in parallel
+#   ./run_capping.sh <preset> 0 1 2 3       # 4 GPUs in parallel
 #
 # Presets:
 #   sanity   5 behaviors, α=0.25 only
@@ -14,49 +15,70 @@
 set -euo pipefail
 
 PRESET="${1:-full}"
+shift                        # remaining args are GPU ids
+GPUS=("$@")                  # e.g. (0 1) or (0 1 2 3)
+N_GPUS=${#GPUS[@]}
 
-# ── Single GPU (default) ────────────────────────────────────────────────────
-if [ $# -lt 3 ]; then
+# ── Single GPU ───────────────────────────────────────────────────────────────
+if [ "$N_GPUS" -eq 0 ]; then
     python run_capping.py --preset "$PRESET"
     exit 0
 fi
 
-GPU0="$2"
-GPU1="$3"
-
-# ── 2-GPU parallel ──────────────────────────────────────────────────────────
-# Split behaviors evenly across both GPUs, merge results afterwards.
+# ── Multi-GPU parallel ───────────────────────────────────────────────────────
+# Divide behaviors evenly; last shard takes any remainder.
 case "$PRESET" in
-    sanity) MID=3  ;;   #   5 behaviors → [0:3]   [3:5]
-    light)  MID=10 ;;   #  20 behaviors → [0:10]  [10:20]
-    full)   MID=50 ;;   # 100 behaviors → [0:50]  [50:100]
-    paper)  MID=50 ;;   # 100 behaviors → [0:50]  [50:100]
+    sanity) N_TOTAL=5   ;;
+    light)  N_TOTAL=20  ;;
+    full)   N_TOTAL=100 ;;
+    paper)  N_TOTAL=100 ;;
     *) echo "Unknown preset: $PRESET"; exit 1 ;;
 esac
 
+CHUNK=$(( N_TOTAL / N_GPUS ))
 TMP="_parallel_tmp"
-mkdir -p "$TMP/gpu0" "$TMP/gpu1"
+PIDS=()
 
-echo "Starting GPU $GPU0 (slice 0:$MID)..."
-CUDA_VISIBLE_DEVICES="$GPU0" python run_capping.py \
-    --preset "$PRESET" --prompt-slice "0:$MID" --output-dir "$TMP/gpu0" \
-    > "$TMP/gpu0.log" 2>&1 &
-PID0=$!
+echo "Splitting $N_TOTAL behaviors across $N_GPUS GPUs (chunk=$CHUNK)..."
 
-echo "Starting GPU $GPU1 (slice $MID:)..."
-CUDA_VISIBLE_DEVICES="$GPU1" python run_capping.py \
-    --preset "$PRESET" --prompt-slice "$MID:" --output-dir "$TMP/gpu1" \
-    > "$TMP/gpu1.log" 2>&1 &
-PID1=$!
+for i in "${!GPUS[@]}"; do
+    GPU="${GPUS[$i]}"
+    START=$(( i * CHUNK ))
+    if [ "$i" -eq $(( N_GPUS - 1 )) ]; then
+        END=""            # last shard takes remainder
+        SLICE="$START:"
+    else
+        END=$(( START + CHUNK ))
+        SLICE="$START:$END"
+    fi
 
-wait $PID0 || { echo "GPU $GPU0 failed — see $TMP/gpu0.log"; exit 1; }
-echo "GPU $GPU0 done."
+    DIR="$TMP/gpu$i"
+    mkdir -p "$DIR"
 
-wait $PID1 || { echo "GPU $GPU1 failed — see $TMP/gpu1.log"; exit 1; }
-echo "GPU $GPU1 done."
+    echo "  GPU $GPU  slice $SLICE  → $DIR"
+    CUDA_VISIBLE_DEVICES="$GPU" python run_capping.py \
+        --preset "$PRESET" --prompt-slice "$SLICE" --output-dir "$DIR" \
+        > "$TMP/gpu${i}.log" 2>&1 &
+    PIDS+=($!)
+done
+
+# Wait for all shards
+FAILED=0
+for i in "${!PIDS[@]}"; do
+    PID="${PIDS[$i]}"
+    GPU="${GPUS[$i]}"
+    if wait "$PID"; then
+        echo "GPU $GPU done."
+    else
+        echo "GPU $GPU FAILED — see $TMP/gpu${i}.log"
+        FAILED=1
+    fi
+done
+
+[ "$FAILED" -eq 1 ] && exit 1
 
 echo "Merging results..."
-python merge_results.py --preset "cap_$PRESET" --gpus "$GPU0" "$GPU1"
+python merge_results.py --preset "cap_$PRESET" --gpus "${GPUS[@]}"
 
 rm -rf "$TMP"
 echo "Done."
